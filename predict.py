@@ -5,6 +5,7 @@ import zipfile
 
 import torch
 from cog import BasePredictor, ConcatenateIterator, Input, Path
+from vllm import EngineArgs, LLMEngine, SamplingParams
 
 from config import DEFAULT_MODEL_NAME, load_tokenizer, load_tensorizer, pull_gcp_file
 from subclass import YieldingLlama
@@ -170,3 +171,83 @@ class EightBitPredictor(Predictor):
             DEFAULT_MODEL_NAME, load_in_8bit=True, device_map="auto"
         )
         self.tokenizer = load_tokenizer()
+
+
+class VLLMPredictor(BasePredictor):
+    def setup(self):
+        # The tokenizer is one that will let engine load, but we have to replace it after the fact.
+        # If we can specify the path to "./llama_weights/llama_tokenizer" instead it will save us a load.
+        # This is currently blocked by a protobuf issue(?).
+        engine_args = EngineArgs(model="./llama_weights/llama-2-7b-chat/", tokenizer="hf-internal-testing/llama-tokenizer")
+        self.engine = LLMEngine.from_engine_args(engine_args)
+        # Workaround for tokenizer loading:
+        self.tokenizer = load_tokenizer()
+        self.engine.tokenizer = self.tokenizer
+
+    def predict(
+        self,
+        prompt: str = Input(description=f"Prompt to send to Llama v2."),
+        max_length: int = Input(
+            description="Maximum number of tokens to generate. A word is generally 2-3 tokens",
+            ge=1,
+            default=500,
+        ),
+        temperature: float = Input(
+            description="Adjusts randomness of outputs, greater than 1 is random and 0 is deterministic, 0.75 is a good starting value.",
+            ge=0.01,
+            le=5,
+            default=0.5,
+        ),
+        top_p: float = Input(
+            description="When decoding text, samples from the top p percentage of most likely tokens; lower to ignore less likely tokens",
+            ge=0.01,
+            le=1.0,
+            default=1.0,
+        ),
+        repetition_penalty: float = Input(
+            description="Penalty for repeated words in generated text; 1 is no penalty, values greater than 1 discourage repetition, less than 1 encourage it.",
+            ge=0.01,
+            le=5,
+            default=1,
+        ),
+        debug: bool = Input(
+            description="provide debugging output in logs", default=False
+        ),
+    ) -> ConcatenateIterator[str]:
+        request_id = 0
+        prompt = "User: " + prompt + '\nAssistant: '#Uncomment if you want to use for demo with no chat memory.
+        sampling_params = SamplingParams(
+            temperature=temperature,
+            top_p=top_p,
+            max_tokens=max_length,
+            presence_penalty=repetition_penalty-1,  # presence uses 0 to mean 'no penalty'.
+        )
+        self.engine.add_request(request_id=request_id, prompt=prompt, sampling_params=sampling_params)
+
+        last_output_length = 0
+        while True:
+            outputs = self.engine.step()
+
+            # Can we guarantee there will be only one output from this?
+            if last_output_length == 0 and not outputs:
+                # Possible we're still waiting for the initial reply.
+                continue
+            elif not outputs:
+                break  # We're done.
+            else:
+                # This is assuming a single prompt.  If we decide to do multiple we have to update this and 'for each' them. 
+                assert(len(outputs) == 1)
+                output = outputs[0]
+                assert(output.request_id == request_id)
+                completion = output.outputs[0]  # If n > 1 we will have multiple of these.
+                new_text = completion.text
+                # Yield the substring that the user hasn't seen.
+                yield new_text[last_output_length:]
+                last_output_length = len(new_text)
+                if output.finished or completion.finish_reason is not None:
+                    break
+
+        if debug:
+            print(f"cur memory: {torch.cuda.memory_allocated()}")
+            print(f"max allocated: {torch.cuda.max_memory_allocated()}")
+            print(f"peak memory: {torch.cuda.max_memory_reserved()}")
