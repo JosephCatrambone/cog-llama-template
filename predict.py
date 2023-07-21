@@ -174,15 +174,21 @@ class EightBitPredictor(Predictor):
 
 
 class VLLMPredictor(BasePredictor):
-    def setup(self):
-        # The tokenizer is one that will let engine load, but we have to replace it after the fact.
-        # If we can specify the path to "./llama_weights/llama_tokenizer" instead it will save us a load.
-        # This is currently blocked by a protobuf issue(?).
-        engine_args = EngineArgs(model="./llama_weights/llama-2-7b-chat/", tokenizer="hf-internal-testing/llama-tokenizer")
-        self.engine = LLMEngine.from_engine_args(engine_args)
-        # Workaround for tokenizer loading:
-        self.tokenizer = load_tokenizer()
-        self.engine.tokenizer = self.tokenizer
+    def setup(self, preload_testing_tokenizer: bool = False):
+        if preload_testing_tokenizer:
+            # The tokenizer is one that will let engine load, but we have to replace it after the fact.
+            # If we can specify the path to "./llama_weights/llama_tokenizer" instead it will save us a load.
+            # This is currently blocked by a protobuf issue(?) on protobuf==4.23.4.
+            engine_args = EngineArgs(model="./llama_weights/llama-2-7b-chat/", tokenizer="hf-internal-testing/llama-tokenizer")
+            self.engine = LLMEngine.from_engine_args(engine_args)
+            # Workaround for tokenizer loading:
+            self.tokenizer = load_tokenizer()
+            self.engine.tokenizer = self.tokenizer
+        else:
+            engine_args = EngineArgs(model="./llama_weights/llama-2-7b-chat", tokenizer="./llama_weights/tokenizer")
+            self.engine = LLMEngine.from_engine_args(engine_args)
+            self.engine.tokenizer.add_special_tokens({"eos_token": "</s>", "bos_token": "</s>", "unk_token": "</s>", "pad_token": "[PAD]"})   
+            self.tokenizer = self.engine.tokenizer  # Note that this is flipped from above.
 
     def predict(
         self,
@@ -241,9 +247,10 @@ class VLLMPredictor(BasePredictor):
                 assert(output.request_id == request_id)
                 completion = output.outputs[0]  # If n > 1 we will have multiple of these.
                 new_text = completion.text
-                # Yield the substring that the user hasn't seen.
-                yield new_text[last_output_length:]
-                last_output_length = len(new_text)
+                if new_text:
+                    # Yield the substring that the user hasn't seen.
+                    yield new_text[last_output_length:]
+                    last_output_length = len(new_text)
                 if output.finished or completion.finish_reason is not None:
                     break
 
